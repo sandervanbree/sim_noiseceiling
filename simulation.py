@@ -9,7 +9,7 @@ from matplotlib.patches import Patch, Ellipse
 from matplotlib.lines import Line2D
 from matplotlib.ticker import FixedLocator, FuncFormatter
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
@@ -22,8 +22,6 @@ N_ITER = 200
 N_STIM = 1000
 N_REP = 10
 RNG_SEED = 0
-MODEL_NOISE_SCALE = 0.0
-MODEL_NOISE_SCALES = [0.0]
 
 FIG_DIR = "figure"
 RESULTS_PATH = Path("sim/results.csv")
@@ -54,7 +52,7 @@ def spearman_brown(r):
 # ------------------------------
 # Main simulation
 # ------------------------------
-def simulate(noise_sd, model_noise_sd, signal, rng):
+def simulate(noise_sd, signal, rng):
     results = []
     for _ in range(N_ITER):
         # Dataset A: signal + noise across reps
@@ -81,15 +79,9 @@ def simulate(noise_sd, model_noise_sd, signal, rng):
         perfect_r = corr(signal, dataset_a)
         perfect_r2 = perfect_r ** 2
 
-        # H2: Noisy model
-        model = signal + model_noise_sd * rng.standard_normal(N_STIM)
-        model_r = corr(model, dataset_a)
-        model_r2 = model_r ** 2
-
         # Derived metrics for plotting compatibility
-        sb_pos = sb_est if sb_est > 0 else np.nan
-        sqrt_sb = np.sqrt(sb_pos) if not np.isnan(sb_pos) else np.nan
-        sb_sq = sb_est ** 2
+        sqrt_sb = np.sqrt(max(sb_est, 0.0))
+        sb_sq = max(sb_est, 0.0) ** 2
 
         results.append({
             'sb_est': sb_est,
@@ -99,8 +91,6 @@ def simulate(noise_sd, model_noise_sd, signal, rng):
             'sb_sq': sb_sq,
             'perfect_r': perfect_r,
             'perfect_r2': perfect_r2,
-            'model_r': model_r,
-            'model_r2': model_r2,
         })
 
     return pd.DataFrame(results)
@@ -109,14 +99,12 @@ def simulate(noise_sd, model_noise_sd, signal, rng):
 def run_case(cfg, case_idx):
     snr = cfg["snr"]
     noise_sd = (1.0 / snr) ** 0.5
-    model_noise_sd = MODEL_NOISE_SCALE * noise_sd
 
-    rng = np.random.default_rng(RNG_SEED + case_idx * 100_000 + int(MODEL_NOISE_SCALE * 1000))
+    rng = np.random.default_rng(RNG_SEED + case_idx * 100_000)
     signal = rng.standard_normal(N_STIM)
 
-    frame = simulate(noise_sd, model_noise_sd, signal, rng)
+    frame = simulate(noise_sd, signal, rng)
 
-    frame.insert(0, "model_noise_sd", model_noise_sd)
     frame.insert(0, "noise_sd", noise_sd)
     frame.insert(0, "snr", snr)
     frame.insert(0, "case", cfg["label"])
@@ -147,14 +135,15 @@ def plot_canvas(df, fig_path):
     if not mask.any():
         return
     data = df.loc[mask].copy()
-    data["sb_sq"] = data["sb_est"] ** 2
+    data["sb_sq"] = data["sb_est"].clip(lower=0) ** 2
     groups = list(data.groupby("case"))
 
     # Use colormap for SNR gradient
+    import matplotlib
     import matplotlib.cm as cm
     n_cases = len(data["case"].unique())
     try:
-        cmap = cm.colormaps.get_cmap("plasma")
+        cmap = matplotlib.colormaps["plasma"]
     except AttributeError:
         cmap = cm.get_cmap("plasma")
     colors = [cmap(i / (n_cases - 1)) for i in range(n_cases)]
@@ -166,8 +155,8 @@ def plot_canvas(df, fig_path):
         ("sb_sq", "Reliability (Spearman-Brown²)"),
     ]
     model_specs = [
-        ("model_r", "Model correlation (r)"),
-        ("model_r2", "Model explainable variance (R²)"),
+        ("perfect_r", "Model correlation (r)"),
+        ("perfect_r2", "Model explainable variance (R²)"),
     ]
     tick_positions = np.linspace(0, 1, 6)
     tick_formatter = FuncFormatter(
@@ -286,10 +275,11 @@ def plot_sb_vs_full_baseline(df, fig_path=FIG_SB_VS_FULL):
     groups = list(data.groupby("case"))
 
     # Use plasma colormap for SNR gradient
+    import matplotlib
     import matplotlib.cm as cm
     n_cases = len(data["case"].unique())
     try:
-        cmap = cm.colormaps.get_cmap("plasma")
+        cmap = matplotlib.colormaps["plasma"]
     except AttributeError:
         cmap = cm.get_cmap("plasma")
     colors = [cmap(i / (n_cases - 1)) for i in range(n_cases)]
@@ -441,7 +431,7 @@ def plot_conceptual_ceiling(fig_path, invert_x=True,
     ax.set_xticks(np.arange(0, x_max + 0.5, 0.5 if x_max <= 2 else 1.0))
     ax.set_ylim(0.45, 1.02)
 
-    ax.set_xlabel('$\sigma^2_B$ (True model + noise)', fontsize=12, weight='bold', labelpad=2)
+    ax.set_xlabel(r'$\sigma^2_B$ (True model + noise)', fontsize=12, weight='bold', labelpad=2)
     ax.set_ylabel('Data vs True model + noise (Pearson $r$)', fontsize=12, weight='bold', labelpad=2)
 
     if invert_x:
@@ -573,34 +563,25 @@ def main():
     plot_conceptual_bar(FIG_CONCEPTUAL_BAR, target_true=0.8, r_model=0.60)
     print(f"  Saved {FIG_CONCEPTUAL_BAR}")
 
-    all_frames = []
-    for scale in MODEL_NOISE_SCALES:
-        global MODEL_NOISE_SCALE
-        MODEL_NOISE_SCALE = scale
-        print(f"\nRunning simulations (model noise scale {scale})...")
+    print("\nRunning simulations...")
+    df = pd.concat([run_case(cfg, i) for i, cfg in enumerate(CASES)], ignore_index=True)
+    print(f"  Negative split-half estimates per SNR: "
+          f"{df.groupby('snr')['sb_est'].apply(lambda x: int((x < 0).sum())).to_dict()}")
 
-        frames = [run_case(cfg, i) for i, cfg in enumerate(CASES)]
-        df = pd.concat(frames, ignore_index=True)
-        all_frames.append(df)
+    fig_path = f"{FIG_DIR}/canvas.pdf"
+    plot_canvas(df, fig_path=fig_path)
+    print(f"  Saved {fig_path}")
 
-        suffix = f"_noise_{int(scale*100):02d}"
-        fig_path = f"{FIG_DIR}/canvas{suffix}.pdf"
-        plot_canvas(df, fig_path=fig_path)
-        print(f"  Saved {fig_path}")
-
-    plot_sb_vs_full_baseline(all_frames[0], fig_path=FIG_SB_VS_FULL)
+    plot_sb_vs_full_baseline(df, fig_path=FIG_SB_VS_FULL)
     print(f"  Saved {FIG_SB_VS_FULL}")
 
-    combined = pd.concat(all_frames, ignore_index=True)
-    summary = combined.groupby(["case", "model_noise_sd"], as_index=False).agg({
+    summary = df.groupby(["case"], as_index=False).agg({
         "snr": "first",
         "sb_est": "mean",
         "sqrt_sb": "mean",
         "full_r": "mean",
         "perfect_r": "mean",
         "perfect_r2": "mean",
-        "model_r": "mean",
-        "model_r2": "mean",
     }).round(3)
     summary.to_csv(RESULTS_PATH, index=False)
     print(f"\nResults saved to {RESULTS_PATH}")
